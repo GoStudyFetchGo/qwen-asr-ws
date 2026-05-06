@@ -116,9 +116,7 @@ class StreamSession:
             unfixed_chunk_num=UNFIXED_CHUNK_NUM,
             unfixed_token_num=UNFIXED_TOKEN_NUM,
             chunk_size_sec=CHUNK_SIZE_SEC,
-            force_language=self.language,
         )
-        self.state.force_language = self.language
 
     def append(self, pcm: bytes):
         self.audio_buffer.extend(pcm)
