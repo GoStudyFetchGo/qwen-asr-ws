@@ -1,239 +1,127 @@
-"""Qwen3-ASR WebSocket streaming server (vLLM backend, native streaming)."""
+"""Production async streaming server for Qwen3-ASR using vLLM AsyncLLMEngine.
+
+Architecture:
+  - One shared AsyncLLMEngine handles all concurrent requests via continuous batching
+  - One shared Qwen3ASRModel helper (CPU only) for prompt building + output parsing
+  - Per-WebSocket: a StreamSession with its own audio buffer, prefix tracking, request lifecycle
+  - Engine batches across all sessions automatically — no global lock, no thread pool
+
+Protocol (unchanged from previous version):
+  Client -> server: {type: "config", config: {language, sampleRate}}
+                    {type: "audio", audio: <base64 PCM int16>}
+                    {type: "done"}
+  Server -> client: {type: "ready"}
+                    {type: "transcription", results: [{is_final, alternatives:[{transcript, words}]}]}
+                    {type: "done"}
+                    {type: "error", error}
+"""
 
 import asyncio
 import base64
 import json
 import logging
 import os
-import time
 from typing import Optional
 
-import numpy as np
+import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
 from qwen_asr import Qwen3ASRModel
+from vllm import AsyncEngineArgs, AsyncLLMEngine
+
+from asr_helpers import LANGUAGE_MAP, resolve_language
+from session import StreamSession
 
 # -------------------- config --------------------
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-ASR-0.6B")
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0")
-SAMPLE_RATE_DEFAULT = 16000
-GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8"))
-MAX_INFERENCE_BATCH_SIZE = int(os.environ.get("MAX_INFERENCE_BATCH_SIZE", "128"))
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "32"))   # small for streaming
-STEP_MS = int(os.environ.get("STEP_MS", "500"))                # how often we feed audio to the model
-UNFIXED_CHUNK_NUM = int(os.environ.get("UNFIXED_CHUNK_NUM", "4"))
-UNFIXED_TOKEN_NUM = int(os.environ.get("UNFIXED_TOKEN_NUM", "5"))
-CHUNK_SIZE_SEC = float(os.environ.get("CHUNK_SIZE_SEC", "1.0"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.85"))
+MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
+MAX_NUM_SEQS = int(os.environ.get("MAX_NUM_SEQS", "256"))
+DTYPE = os.environ.get("DTYPE", "bfloat16")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
-LANGUAGE_MAP = {
-    "de": "German", "de-DE": "German",
-    "nl": "Dutch", "nl-NL": "Dutch", "nl-BE": "Dutch",
-    "sv": "Swedish", "sv-SE": "Swedish",
-    "el": "Greek", "el-GR": "Greek",
-    "en": "English", "en-US": "English", "en-GB": "English",
-    "es": "Spanish", "es-ES": "Spanish", "es-US": "Spanish",
-    "fr": "French", "fr-FR": "French", "fr-CA": "French",
-    "it": "Italian", "it-IT": "Italian",
-    "pt": "Portuguese", "pt-BR": "Portuguese", "pt-PT": "Portuguese",
-    "ar": "Arabic", "ar-AR": "Arabic",
-    "zh": "Chinese", "zh-CN": "Chinese",
-    "ja": "Japanese", "ja-JP": "Japanese",
-    "ko": "Korean", "ko-KR": "Korean",
-    "ru": "Russian", "ru-RU": "Russian",
-    "hi": "Hindi", "hi-IN": "Hindi",
-    "id": "Indonesian", "id-ID": "Indonesian",
-    "fil": "Filipino",
-    "fa": "Persian", "fa-IR": "Persian",
-    "tr": "Turkish", "tr-TR": "Turkish",
-    "pl": "Polish", "pl-PL": "Polish",
-    "cs": "Czech", "cs-CZ": "Czech",
-    "da": "Danish", "da-DK": "Danish",
-    "fi": "Finnish", "fi-FI": "Finnish",
-    "th": "Thai", "th-TH": "Thai",
-    "vi": "Vietnamese", "vi-VN": "Vietnamese",
-    "hu": "Hungarian",
-    "ro": "Romanian",
-    "mk": "Macedonian",
-    "ms": "Malay",
-}
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+)
+log = logging.getLogger("server")
 
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("qwen-asr-server")
+# globals (initialized at startup)
+engine: Optional[AsyncLLMEngine] = None
+helper: Optional[Qwen3ASRModel] = None
 
-model: Optional[Qwen3ASRModel] = None
+# metrics
 active_sessions = 0
-
-
-# -------------------- model loading --------------------
+total_sessions = 0
 
 app = FastAPI()
 
 
-@app.on_event("startup")
-async def load_model():
-    global model
-    log.info(f"Loading {MODEL_PATH} (vLLM backend)...")
-    t0 = time.time()
-    model = Qwen3ASRModel.LLM(
-        model=MODEL_PATH,
-        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
-        max_inference_batch_size=MAX_INFERENCE_BATCH_SIZE,
-        max_new_tokens=MAX_NEW_TOKENS,
-    )
-    log.info(f"Model loaded in {time.time() - t0:.1f}s")
+# -------------------- lifecycle --------------------
 
+@app.on_event("startup")
+async def startup():
+    global engine, helper
+
+    log.info(f"Loading prompt-builder helper on CPU ({MODEL_PATH})...")
+    # CPU-only helper — gives us _build_text_prompt() and processor/tokenizer for prefix rollback.
+    # No GPU memory cost. ~1.5GB CPU RAM.
+    helper = Qwen3ASRModel.from_pretrained(
+        MODEL_PATH,
+        dtype=torch.float32,
+        device_map="cpu",
+    )
+    log.info("Helper ready (CPU).")
+
+    log.info(f"Initializing AsyncLLMEngine for {MODEL_PATH} on GPU...")
+    engine_args = AsyncEngineArgs(
+        model=MODEL_PATH,
+        dtype=DTYPE,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=MAX_NUM_SEQS,
+        trust_remote_code=True,
+        enforce_eager=False,
+        disable_log_requests=True,
+    )
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    log.info(f"AsyncLLMEngine ready (max_num_seqs={MAX_NUM_SEQS}, gpu_mem={GPU_MEMORY_UTILIZATION}).")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    log.info(f"Shutdown initiated. active_sessions={active_sessions}")
+
+
+# -------------------- health --------------------
 
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
+        "status": "ok" if engine is not None else "loading",
         "model": MODEL_PATH,
-        "loaded": model is not None,
+        "engine_ready": engine is not None,
         "active_sessions": active_sessions,
-        "backend": "vllm",
+        "total_sessions_served": total_sessions,
     }
 
 
-# -------------------- per-session state --------------------
-
-class StreamSession:
-    def __init__(self, language: str, sample_rate: int):
-        self.language = language
-        self.sample_rate = sample_rate
-        self.audio_buffer = bytearray()
-        self.last_full_text = ""
-        self.committed_text = ""
-        self.state = None
-        self.running = True
-
-    def init_state(self):
-        self.state = model.init_streaming_state(
-            language=self.language,
-            unfixed_chunk_num=UNFIXED_CHUNK_NUM,
-            unfixed_token_num=UNFIXED_TOKEN_NUM,
-            chunk_size_sec=CHUNK_SIZE_SEC,
-        )
-
-    def append(self, pcm: bytes):
-        self.audio_buffer.extend(pcm)
-
-    def pop_step(self) -> Optional[np.ndarray]:
-        """Pop STEP_MS worth of audio. Returns None if not enough buffered."""
-        step_bytes = int(STEP_MS / 1000 * self.sample_rate * 2)
-        if len(self.audio_buffer) < step_bytes:
-            return None
-        chunk = bytes(self.audio_buffer[:step_bytes])
-        del self.audio_buffer[:step_bytes]
-        return np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-
-    def drain(self) -> Optional[np.ndarray]:
-        """Pop everything left in buffer."""
-        if not self.audio_buffer:
-            return None
-        chunk = bytes(self.audio_buffer)
-        self.audio_buffer.clear()
-        return np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-
-    def stop(self):
-        self.running = False
-
-
-def stable_prefix(prev: str, curr: str, after: str) -> str:
-    """LocalAgreement-2 word-level common prefix."""
-    if not prev.startswith(after) or not curr.startswith(after):
-        return after
-    prev_tail = prev[len(after):].split()
-    curr_tail = curr[len(after):].split()
-    common = []
-    for a, b in zip(prev_tail, curr_tail):
-        if a == b:
-            common.append(a)
-        else:
-            break
-    if not common:
-        return after
-    return after + (" " if after and not after.endswith(" ") else "") + " ".join(common)
-
-
-# -------------------- transcription loop --------------------
-
-async def feed_chunk(session: StreamSession, segment: np.ndarray):
-    """Feed one segment to the model and update state.text."""
-    def _call():
-        model.streaming_transcribe(segment, session.state)
-        return session.state.text or ""
-    return await asyncio.to_thread(_call)
-
-
-async def transcribe_loop(ws: WebSocket, session: StreamSession):
-    poll_interval = STEP_MS / 1000 / 2  # poll twice per step
-    while session.running:
-        await asyncio.sleep(poll_interval)
-        if not session.running:
-            break
-
-        segment = session.pop_step()
-        if segment is None:
-            continue
-
-        try:
-            text = await feed_chunk(session, segment)
-        except Exception as e:
-            log.exception("streaming_transcribe failed")
-            await safe_send(ws, {"type": "error", "error": f"transcribe: {e}"})
-            continue
-
-        if not text or text == session.last_full_text:
-            continue
-
-        new_committed = stable_prefix(session.last_full_text, text, session.committed_text)
-        if len(new_committed) > len(session.committed_text):
-            final_chunk = new_committed[len(session.committed_text):].strip()
-            if final_chunk:
-                await safe_send(ws, {
-                    "type": "transcription",
-                    "results": [{
-                        "is_final": True,
-                        "alternatives": [{"transcript": final_chunk, "words": []}],
-                    }],
-                })
-            session.committed_text = new_committed
-
-        partial = text[len(session.committed_text):].strip()
-        if partial:
-            await safe_send(ws, {
-                "type": "transcription",
-                "results": [{
-                    "is_final": False,
-                    "alternatives": [{"transcript": partial, "words": []}],
-                }],
-            })
-
-        session.last_full_text = text
-
-
-async def safe_send(ws: WebSocket, msg: dict):
-    try:
-        await ws.send_text(json.dumps(msg))
-    except Exception:
-        pass
-
-
-# -------------------- websocket endpoint --------------------
+# -------------------- websocket --------------------
 
 @app.websocket("/transcribe")
 async def transcribe_ws(websocket: WebSocket):
-    global active_sessions
+    global active_sessions, total_sessions
+
     await websocket.accept()
+    total_sessions += 1
+    sid = total_sessions
     active_sessions += 1
-    log.info(f"client connected (active={active_sessions})")
+    log.info(f"[{sid}] connected (active={active_sessions})")
 
     session: Optional[StreamSession] = None
-    task: Optional[asyncio.Task] = None
 
     try:
         while True:
@@ -242,86 +130,83 @@ async def transcribe_ws(websocket: WebSocket):
             mtype = msg.get("type")
 
             if mtype == "config":
+                if session is not None:
+                    await _send(websocket, {"type": "error", "error": "config already received"})
+                    continue
+
                 cfg = msg.get("config", {}) or {}
                 lang_code = cfg.get("language", "en-US")
-                lang = LANGUAGE_MAP.get(lang_code) or LANGUAGE_MAP.get(lang_code.split("-")[0].lower())
+                lang = resolve_language(lang_code)
                 if lang is None:
-                    await safe_send(websocket, {"type": "error", "error": f"unsupported language: {lang_code}"})
+                    await _send(websocket, {"type": "error", "error": f"unsupported language: {lang_code}"})
                     await websocket.close()
                     return
-                sr = int(cfg.get("sampleRate", SAMPLE_RATE_DEFAULT))
-                session = StreamSession(language=lang, sample_rate=sr)
-                # init_streaming_state runs sync, may take a few hundred ms
-                await asyncio.to_thread(session.init_state)
-                task = asyncio.create_task(transcribe_loop(websocket, session))
-                log.info(f"session start lang={lang} sr={sr}")
-                await safe_send(websocket, {"type": "ready"})
+
+                sr = int(cfg.get("sampleRate", 16000))
+
+                session = StreamSession(
+                    session_id=sid,
+                    websocket=websocket,
+                    engine=engine,
+                    helper=helper,
+                    force_language=lang,
+                    sample_rate=sr,
+                )
+                await session.start()
+                log.info(f"[{sid}] session started lang={lang} sr={sr}")
+                await _send(websocket, {"type": "ready"})
 
             elif mtype == "audio":
                 if session is None:
-                    await safe_send(websocket, {"type": "error", "error": "audio before config"})
+                    await _send(websocket, {"type": "error", "error": "audio before config"})
                     continue
-                audio_b64 = msg.get("audio", "")
+                audio_b64 = msg.get("audio")
                 if audio_b64:
-                    session.append(base64.b64decode(audio_b64))
+                    session.append_audio(base64.b64decode(audio_b64))
 
             elif mtype == "done":
-                log.info("client done")
+                log.info(f"[{sid}] client signalled done")
                 break
 
             else:
-                log.warning(f"unknown message type: {mtype}")
+                log.warning(f"[{sid}] unknown message type: {mtype}")
 
     except WebSocketDisconnect:
-        log.info("client disconnected")
+        log.info(f"[{sid}] client disconnected")
     except Exception:
-        log.exception("websocket error")
+        log.exception(f"[{sid}] websocket loop error")
     finally:
-        if session and session.state is not None:
-            session.stop()
-
-            # flush any remaining audio
-            tail = session.drain()
-            if tail is not None and len(tail) > 0:
-                try:
-                    await feed_chunk(session, tail)
-                except Exception:
-                    log.exception("tail feed failed")
-
-            # finalize
+        if session:
             try:
-                def _finish():
-                    model.finish_streaming_transcribe(session.state)
-                    return session.state.text or ""
-                final_text = await asyncio.to_thread(_finish)
-                remaining = final_text[len(session.committed_text):].strip()
-                if remaining:
-                    await safe_send(websocket, {
-                        "type": "transcription",
-                        "results": [{
-                            "is_final": True,
-                            "alternatives": [{"transcript": remaining, "words": []}],
-                        }],
-                    })
+                await session.finalize()
             except Exception:
-                log.exception("finish_streaming_transcribe failed")
+                log.exception(f"[{sid}] finalize error")
+            await session.close()
 
-        if task:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        await safe_send(websocket, {"type": "done"})
+        await _send(websocket, {"type": "done"})
         try:
             await websocket.close()
         except Exception:
             pass
 
         active_sessions -= 1
-        log.info(f"session end (active={active_sessions})")
+        log.info(f"[{sid}] cleanup done (active={active_sessions})")
 
+
+async def _send(ws: WebSocket, msg: dict):
+    try:
+        await ws.send_text(json.dumps(msg))
+    except Exception:
+        pass
+
+
+# -------------------- main --------------------
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=HOST, port=PORT, ws_max_size=16 * 1024 * 1024, log_level=LOG_LEVEL.lower())
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        ws_max_size=16 * 1024 * 1024,
+        log_level=LOG_LEVEL.lower(),
+    )

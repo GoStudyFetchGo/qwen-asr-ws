@@ -12,10 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --ignore-installed blinker && \
+    pip install -r requirements.txt
 
-COPY server.py .
+COPY server.py session.py asr_helpers.py ./
 
 EXPOSE 8765
 
+# Mount /cache/huggingface as a volume in production to avoid re-downloading the model
 CMD ["python", "server.py"]
