@@ -1,14 +1,4 @@
-"""Qwen3-ASR WebSocket streaming server.
-
-Mirrors the JSON protocol used by the existing Riva proxy:
-  Client -> server: {type: "config", config: {language, sampleRate}}
-                    {type: "audio", audio: <base64 PCM int16>}
-                    {type: "done"}
-  Server -> client: {type: "ready"}
-                    {type: "transcription", results: [{is_final, alternatives:[{transcript, words}]}]}
-                    {type: "done"}
-                    {type: "error", error}
-"""
+"""Qwen3-ASR WebSocket streaming server (vLLM backend, native streaming)."""
 
 import asyncio
 import base64
@@ -19,7 +9,6 @@ import time
 from typing import Optional
 
 import numpy as np
-import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -30,16 +19,16 @@ from qwen_asr import Qwen3ASRModel
 MODEL_PATH = os.environ.get("MODEL_PATH", "Qwen/Qwen3-ASR-0.6B")
 PORT = int(os.environ.get("PORT", "8765"))
 HOST = os.environ.get("HOST", "0.0.0.0")
-DEVICE_MAP = os.environ.get("DEVICE_MAP", "cuda:0")  # "cpu" / "mps" / "cuda:0"
-DTYPE = os.environ.get("DTYPE", "bfloat16")          # "float32" on CPU/MPS, "bfloat16" on CUDA
 SAMPLE_RATE_DEFAULT = 16000
-TRANSCRIBE_INTERVAL = float(os.environ.get("TRANSCRIBE_INTERVAL", "0.7"))
-MAX_BUFFER_SECONDS = int(os.environ.get("MAX_BUFFER_SECONDS", "30"))
+GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8"))
+MAX_INFERENCE_BATCH_SIZE = int(os.environ.get("MAX_INFERENCE_BATCH_SIZE", "128"))
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "32"))   # small for streaming
+STEP_MS = int(os.environ.get("STEP_MS", "500"))                # how often we feed audio to the model
+UNFIXED_CHUNK_NUM = int(os.environ.get("UNFIXED_CHUNK_NUM", "4"))
+UNFIXED_TOKEN_NUM = int(os.environ.get("UNFIXED_TOKEN_NUM", "5"))
+CHUNK_SIZE_SEC = float(os.environ.get("CHUNK_SIZE_SEC", "1.0"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
-DTYPE_MAP = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-
-# BCP-47 -> qwen-asr language string
 LANGUAGE_MAP = {
     "de": "German", "de-DE": "German",
     "nl": "Dutch", "nl-NL": "Dutch", "nl-BE": "Dutch",
@@ -87,14 +76,13 @@ app = FastAPI()
 @app.on_event("startup")
 async def load_model():
     global model
-    log.info(f"Loading {MODEL_PATH} on {DEVICE_MAP} ({DTYPE})...")
+    log.info(f"Loading {MODEL_PATH} (vLLM backend)...")
     t0 = time.time()
-    model = Qwen3ASRModel.from_pretrained(
-        MODEL_PATH,
-        dtype=DTYPE_MAP[DTYPE],
-        device_map=DEVICE_MAP,
-        max_inference_batch_size=32,
-        max_new_tokens=256,
+    model = Qwen3ASRModel.LLM(
+        model=MODEL_PATH,
+        gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+        max_inference_batch_size=MAX_INFERENCE_BATCH_SIZE,
+        max_new_tokens=MAX_NEW_TOKENS,
     )
     log.info(f"Model loaded in {time.time() - t0:.1f}s")
 
@@ -106,6 +94,7 @@ async def health():
         "model": MODEL_PATH,
         "loaded": model is not None,
         "active_sessions": active_sessions,
+        "backend": "vllm",
     }
 
 
@@ -118,26 +107,45 @@ class StreamSession:
         self.audio_buffer = bytearray()
         self.last_full_text = ""
         self.committed_text = ""
+        self.state = None
         self.running = True
+
+    def init_state(self):
+        # NOTE: force_language is the documented param in qwen-asr's ASRStreamingState.
+        # If your installed version uses a different name, adjust here.
+        self.state = model.init_streaming_state(
+            unfixed_chunk_num=UNFIXED_CHUNK_NUM,
+            unfixed_token_num=UNFIXED_TOKEN_NUM,
+            chunk_size_sec=CHUNK_SIZE_SEC,
+            force_language=self.language,
+        )
 
     def append(self, pcm: bytes):
         self.audio_buffer.extend(pcm)
-        max_bytes = MAX_BUFFER_SECONDS * self.sample_rate * 2
-        if len(self.audio_buffer) > max_bytes:
-            del self.audio_buffer[: len(self.audio_buffer) - max_bytes]
 
-    def audio_array(self) -> np.ndarray:
+    def pop_step(self) -> Optional[np.ndarray]:
+        """Pop STEP_MS worth of audio. Returns None if not enough buffered."""
+        step_bytes = int(STEP_MS / 1000 * self.sample_rate * 2)
+        if len(self.audio_buffer) < step_bytes:
+            return None
+        chunk = bytes(self.audio_buffer[:step_bytes])
+        del self.audio_buffer[:step_bytes]
+        return np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def drain(self) -> Optional[np.ndarray]:
+        """Pop everything left in buffer."""
         if not self.audio_buffer:
-            return np.zeros(0, dtype=np.float32)
-        return np.frombuffer(bytes(self.audio_buffer), dtype=np.int16).astype(np.float32) / 32768.0
+            return None
+        chunk = bytes(self.audio_buffer)
+        self.audio_buffer.clear()
+        return np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
 
     def stop(self):
         self.running = False
 
 
 def stable_prefix(prev: str, curr: str, after: str) -> str:
-    """LocalAgreement-2: word-level longest common prefix between two transcripts,
-    starting after the already-committed text."""
+    """LocalAgreement-2 word-level common prefix."""
     if not prev.startswith(after) or not curr.startswith(after):
         return after
     prev_tail = prev[len(after):].split()
@@ -155,34 +163,29 @@ def stable_prefix(prev: str, curr: str, after: str) -> str:
 
 # -------------------- transcription loop --------------------
 
-async def run_transcribe(session: StreamSession) -> str:
-    """Run one transcribe call in a thread (GPU work is blocking)."""
-    audio = session.audio_array()
-    if len(audio) < session.sample_rate * 0.3:
-        return ""
-
+async def feed_chunk(session: StreamSession, segment: np.ndarray):
+    """Feed one segment to the model and update state.text."""
     def _call():
-        results = model.transcribe(
-            audio=(audio, session.sample_rate),
-            language=session.language,
-            return_time_stamps=False,
-        )
-        return results[0].text if results else ""
-
+        model.streaming_transcribe(segment, session.state)
+        return session.state.text or ""
     return await asyncio.to_thread(_call)
 
 
 async def transcribe_loop(ws: WebSocket, session: StreamSession):
-    """Periodic transcribe + LocalAgreement emission."""
+    poll_interval = STEP_MS / 1000 / 2  # poll twice per step
     while session.running:
-        await asyncio.sleep(TRANSCRIBE_INTERVAL)
+        await asyncio.sleep(poll_interval)
         if not session.running:
             break
 
+        segment = session.pop_step()
+        if segment is None:
+            continue
+
         try:
-            text = await run_transcribe(session)
+            text = await feed_chunk(session, segment)
         except Exception as e:
-            log.exception("transcribe failed")
+            log.exception("streaming_transcribe failed")
             await safe_send(ws, {"type": "error", "error": f"transcribe: {e}"})
             continue
 
@@ -250,6 +253,8 @@ async def transcribe_ws(websocket: WebSocket):
                     return
                 sr = int(cfg.get("sampleRate", SAMPLE_RATE_DEFAULT))
                 session = StreamSession(language=lang, sample_rate=sr)
+                # init_streaming_state runs sync, may take a few hundred ms
+                await asyncio.to_thread(session.init_state)
                 task = asyncio.create_task(transcribe_loop(websocket, session))
                 log.info(f"session start lang={lang} sr={sr}")
                 await safe_send(websocket, {"type": "ready"})
@@ -274,10 +279,23 @@ async def transcribe_ws(websocket: WebSocket):
     except Exception:
         log.exception("websocket error")
     finally:
-        if session:
+        if session and session.state is not None:
             session.stop()
+
+            # flush any remaining audio
+            tail = session.drain()
+            if tail is not None and len(tail) > 0:
+                try:
+                    await feed_chunk(session, tail)
+                except Exception:
+                    log.exception("tail feed failed")
+
+            # finalize
             try:
-                final_text = await run_transcribe(session)
+                def _finish():
+                    model.finish_streaming_transcribe(session.state)
+                    return session.state.text or ""
+                final_text = await asyncio.to_thread(_finish)
                 remaining = final_text[len(session.committed_text):].strip()
                 if remaining:
                     await safe_send(websocket, {
@@ -288,7 +306,7 @@ async def transcribe_ws(websocket: WebSocket):
                         }],
                     })
             except Exception:
-                log.exception("final transcribe failed")
+                log.exception("finish_streaming_transcribe failed")
 
         if task:
             task.cancel()

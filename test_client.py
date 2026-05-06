@@ -9,6 +9,11 @@ import time
 import soundfile as sf
 import websockets
 
+import ssl
+ssl_ctx = ssl.create_default_context()
+ssl_ctx.check_hostname = False
+ssl_ctx.verify_mode = ssl.CERT_NONE
+
 
 async def stream_file(uri: str, wav_path: str, language: str, chunk_ms: int = 100):
     audio, sr = sf.read(wav_path, dtype="int16")
@@ -16,7 +21,7 @@ async def stream_file(uri: str, wav_path: str, language: str, chunk_ms: int = 10
         audio = audio[:, 0]
     chunk_samples = int(sr * chunk_ms / 1000)
 
-    async with websockets.connect(uri, max_size=16 * 1024 * 1024) as ws:
+    async with websockets.connect(uri, max_size=16 * 1024 * 1024, ssl=ssl_ctx) as ws:
         await ws.send(json.dumps({
             "type": "config",
             "config": {"language": language, "sampleRate": sr},

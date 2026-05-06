@@ -18,5 +18,4 @@ COPY server.py .
 
 EXPOSE 8765
 
-# Mount /cache/huggingface as a volume in production to avoid re-downloading the model
 CMD ["python", "server.py"]
